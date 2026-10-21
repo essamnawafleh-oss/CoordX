@@ -3,12 +3,13 @@ import os
 import subprocess
 import sys
 
-from PySide6.QtCore import QSettings, QSize, Qt, QThread, Signal
-from PySide6.QtGui import QAction, QIcon, QKeySequence, QPixmap
+from PySide6.QtCore import QSettings, QSize, Qt, QThread, QUrl, Signal
+from PySide6.QtGui import QAction, QDesktopServices, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QFileDialog, QFrame, QGridLayout,
-                               QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-                               QMainWindow, QMessageBox, QProgressDialog, QPushButton, QSizePolicy, QSplitter,
-                               QTableWidget, QTableWidgetItem, QTabWidget, QToolBar, QVBoxLayout, QWidget)
+                               QDoubleSpinBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
+                               QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressDialog, QPushButton,
+                               QSizePolicy, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QToolBar,
+                               QToolButton, QVBoxLayout, QWidget)
 
 from .. import __version__
 from ..checks import analyze
@@ -16,7 +17,10 @@ from ..excel_io import write_csv, write_excel
 from ..export_dxf import DxfOptions, build_drawing, export_dxf
 from ..i18n import lang, set_lang, tr
 from ..model import Parcel, Point
-from ..sources import ALL_EXT, load_file
+from ..autocad import open_in_autocad
+from ..imageops import estimate_skew, read_tables, rotate_image
+from ..report import write_report
+from ..sources import ALL_EXT, DwgError, load_file
 from ..textnorm import parse_float
 from .dialogs import DxfDialog, PointDialog
 from .drawing_view import DrawingView
@@ -47,6 +51,22 @@ class LoadWorker(QThread):
                 self.loaded.emit(path, load_file(path))
             except Exception as e:  # keep going with the other files
                 self.failed.emit(path, str(e))
+
+
+class TaskWorker(QThread):
+    """Runs one slow function (OCR, straightening) off the UI thread."""
+    done = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def run(self):
+        try:
+            self.done.emit(self.fn())
+        except Exception as e:
+            self.failed.emit(str(e))
 
 
 def open_folder(path):
@@ -120,6 +140,8 @@ class MainWindow(QMainWindow):
         self.act_about = self._action("info", self.about)
         self.act_xlsx = self._action("excel", self.export_excel)
         self.act_csv = self._action("csv", self.export_csv)
+        self.act_pdf = self._action("pdf", self.export_pdf, QKeySequence.Print)
+        self.act_acad = self._action("acad", self.open_in_autocad)
         self.act_dxf = self._action("dxf", self.export_dxf, QKeySequence.Save)
         for a in (self.act_open, self.act_new, self.act_remove):
             tb.addAction(a)
@@ -131,8 +153,18 @@ class MainWindow(QMainWindow):
         for a in (self.act_theme, self.act_lang, self.act_about):
             tb.addAction(a)
         tb.addSeparator()
-        for a in (self.act_xlsx, self.act_csv, self.act_dxf):
-            tb.addAction(a)
+        self.export_menu = QMenu(self)
+        for a in (self.act_pdf, self.act_xlsx, self.act_csv):
+            self.export_menu.addAction(a)
+        self.btn_export = QToolButton()
+        self.btn_export.setMenu(self.export_menu)
+        self.btn_export.setPopupMode(QToolButton.InstantPopup)
+        self.btn_export.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._icon_names[self.btn_export] = "export"
+        self.btn_export.setFocusPolicy(Qt.NoFocus)
+        tb.addWidget(self.btn_export)
+        tb.addAction(self.act_acad)
+        tb.addAction(self.act_dxf)
         tb.widgetForAction(self.act_dxf).setObjectName("primary")
         for a in (self.act_theme, self.act_lang, self.act_about):
             tb.widgetForAction(a).setToolButtonStyle(Qt.ToolButtonIconOnly)
@@ -148,6 +180,8 @@ class MainWindow(QMainWindow):
         ll.addLayout(head)
         self.list = QListWidget()
         self.list.setIconSize(QSize(10, 10))
+        self.list.setTextElideMode(Qt.ElideMiddle)
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.list.currentRowChanged.connect(self._on_parcel_selected)
         self.lbl_list_hint = QLabel(objectName="caption", wordWrap=True)
         ll.addWidget(self.lbl_list_hint)
@@ -159,15 +193,35 @@ class MainWindow(QMainWindow):
         ml = QVBoxLayout(img_tab)
         ml.setContentsMargins(S2, S3, S2, S2)
         ml.setSpacing(S2)
-        top = QHBoxLayout()
         self.lbl_source = QLabel(objectName="caption")
-        top.addWidget(self.lbl_source, 1)
+        ml.addWidget(self.lbl_source)
+        top = QHBoxLayout()
+        top.setSpacing(S1)
+        self.btn_region = QPushButton(clicked=self.start_region_read, checkable=True)
+        self.btn_reread = QPushButton(objectName="ghost", clicked=self.reread_image)
+        self.btn_rotl = QPushButton(objectName="ghost", clicked=lambda: self.rotate_by(90))
+        self.btn_rotr = QPushButton(objectName="ghost", clicked=lambda: self.rotate_by(-90))
+        self.spin_angle = QDoubleSpinBox(decimals=1, minimum=-180, maximum=180, singleStep=0.5, suffix="°")
+        self.spin_angle.setLayoutDirection(Qt.LeftToRight)
+        self.spin_angle.setFixedWidth(84)
+        self.spin_angle.editingFinished.connect(lambda: self.set_rotation(self.spin_angle.value()))
+        self.btn_level = QPushButton(objectName="ghost", clicked=self.auto_straighten)
         self.btn_fit = QPushButton(objectName="ghost", clicked=lambda: self.view.fit())
-        self._icon_names[self.btn_fit] = "fit"
-        top.addWidget(self.btn_fit)
+        for b, ic in ((self.btn_region, "region"), (self.btn_reread, "reread"), (self.btn_rotl, "rotl"),
+                      (self.btn_rotr, "rotr"), (self.btn_level, "level"), (self.btn_fit, "fit")):
+            self._icon_names[b] = ic
+        top.addWidget(self.btn_region)
+        top.addWidget(self.btn_reread)
+        top.addStretch()
+        for w in (self.btn_rotl, self.btn_rotr, self.spin_angle, self.btn_level, self.btn_fit):
+            top.addWidget(w)
         ml.addLayout(top)
         self.view = ImageView()
+        self.view.region_selected.connect(self._on_region_selected)
+        self.view.region_cancelled.connect(lambda: self._end_region_mode())
         ml.addWidget(self.view, 1)
+        self.lbl_image_hint = QLabel(objectName="caption", wordWrap=True)
+        ml.addWidget(self.lbl_image_hint)
 
         draw_tab = QWidget()
         dl = QVBoxLayout(draw_tab)
@@ -353,6 +407,19 @@ class MainWindow(QMainWindow):
             a.setText(tr(k))
             a.setToolTip(tr(k))
         self.act_open.setToolTip(tr("open_tip"))
+        for a, k in ((self.act_pdf, "export_pdf"), (self.act_acad, "open_acad")):
+            a.setText(tr(k))
+            a.setToolTip(tr(k + "_tip"))
+        self.btn_export.setText(tr("export_more"))
+        self.btn_region.setText(tr("read_region"))
+        self.btn_region.setToolTip(tr("read_region_tip"))
+        self.btn_reread.setText(tr("reread"))
+        self.btn_reread.setToolTip(tr("reread_tip"))
+        self.btn_rotl.setToolTip(tr("rotate_left"))
+        self.btn_rotr.setToolTip(tr("rotate_right"))
+        self.spin_angle.setToolTip(tr("angle_tip"))
+        self.btn_level.setText(tr("straighten"))
+        self.btn_level.setToolTip(tr("straighten_tip"))
         self.lbl_parcels.setText(tr("parcels"))
         self.lbl_list_hint.setText(tr("list_hint"))
         self.btn_fit.setText(tr("fit"))
@@ -414,9 +481,15 @@ class MainWindow(QMainWindow):
         self.worker = LoadWorker(paths)
         self.worker.file_started.connect(self._on_file_started)
         self.worker.loaded.connect(self._on_loaded)
-        self.worker.failed.connect(lambda p, e: self._errors.append(tr("read_error", f=os.path.basename(p), e=e)))
+        self.worker.failed.connect(self._on_load_failed)
         self.worker.finished.connect(self._on_load_finished)
         self.worker.start()
+
+    def _on_load_failed(self, path, err):
+        if path.lower().endswith(".dwg"):
+            self._errors.append(tr("dwg_error", f=os.path.basename(path)))
+        else:
+            self._errors.append(tr("read_error", f=os.path.basename(path), e=err))
 
     def _on_file_started(self, path, i, total):
         self.progress.setLabelText(tr("reading_file", f=os.path.basename(path)) + f"  ({i + 1}/{total})")
@@ -512,6 +585,12 @@ class MainWindow(QMainWindow):
             return
         if p.image is None:
             self.tabs.setCurrentIndex(1)
+        has_img = p.image is not None
+        for w in (self.btn_region, self.btn_reread, self.btn_rotl, self.btn_rotr, self.spin_angle, self.btn_level):
+            w.setEnabled(has_img)
+        self.spin_angle.blockSignals(True)
+        self.spin_angle.setValue(p.rotation)
+        self.spin_angle.blockSignals(False)
         self.ed_name.setText(p.name)
         self.ed_area.setText("" if p.stated_area is None else f"{p.stated_area:g}")
         # isolate the file name so "1.jpg" doesn't turn into "jpg.1" in right-to-left text
@@ -800,13 +879,19 @@ class MainWindow(QMainWindow):
             self.settings.setValue("out_dir", os.path.dirname(path))
         return path
 
-    def _done(self, path):
+    def _done(self, path, dxf=False):
         self.statusBar().showMessage(tr("saved", f=path), 10000)
         box = QMessageBox(QMessageBox.Information, tr("app_name"), tr("saved", f=path), parent=self)
+        acad_btn = box.addButton(tr("open_acad"), QMessageBox.AcceptRole) if dxf else None
         open_btn = box.addButton(tr("open_folder"), QMessageBox.ActionRole)
         box.addButton(tr("close"), QMessageBox.RejectRole)
+        if acad_btn is not None:
+            acad_btn.setObjectName("primary")
+            box.setDefaultButton(acad_btn)
         box.exec()
-        if box.clickedButton() == open_btn:
+        if acad_btn is not None and box.clickedButton() == acad_btn:
+            self.open_in_autocad(path)
+        elif box.clickedButton() == open_btn:
             open_folder(path)
 
     def _ready_parcels(self):
@@ -846,7 +931,7 @@ class MainWindow(QMainWindow):
                 path = self._save_path(_safe_file(name), ".dxf", tr("export_dxf"))
                 if path:
                     export_dxf(chosen, path, opts)
-                    self._done(path)
+                    self._done(path, dxf=True)
         except Exception as e:
             QMessageBox.critical(self, tr("app_name"), tr("save_error", e=e))
 
@@ -878,6 +963,166 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, tr("app_name"), tr("save_error", e=e))
 
+    # -------------------------------------------------------- image tools
+    def _busy(self, text, fn, on_done):
+        """Run fn in the background behind a small modal progress box."""
+        dlg = QProgressDialog(text, None, 0, 0, self)
+        dlg.setWindowTitle(tr("app_name"))
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(300)
+        worker = TaskWorker(fn)
+        self._task = worker  # keep a reference while it runs
+
+        def finish(result):
+            dlg.close()
+            on_done(result)
+
+        def fail(err):
+            dlg.close()
+            QMessageBox.warning(self, tr("app_name"), tr("read_error", f=self.current.name if self.current else "", e=err))
+
+        worker.done.connect(finish)
+        worker.failed.connect(fail)
+        worker.start()
+        dlg.show()
+
+    def set_rotation(self, angle):
+        p = self.current
+        if p is None or p.image is None:
+            return
+        angle = round(((angle + 180) % 360) - 180, 2)
+        if abs(angle - p.rotation) < 1e-6:
+            return
+        p.base_image = p.base_image or p.image
+        p.rotation = angle
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            p.image = rotate_image(p.base_image, angle)
+        finally:
+            QApplication.restoreOverrideCursor()
+        for pt in p.points:
+            pt.bbox = None  # the boxes belonged to the old orientation
+        self._show_parcel(p)
+        self.lbl_image_hint.setText(tr("rotated_hint"))
+
+    def rotate_by(self, delta):
+        if self.current is not None:
+            self.set_rotation(self.current.rotation + delta)
+
+    def auto_straighten(self):
+        p = self.current
+        if p is None or p.image is None:
+            return
+        self._busy(tr("straightening"), lambda: estimate_skew(p.image),
+                   lambda a: self.rotate_by(a) if abs(a) >= 0.1 else
+                   self.statusBar().showMessage(tr("already_straight"), 6000))
+
+    def start_region_read(self):
+        if self.view.start_region_select():
+            self.btn_region.setChecked(True)
+            self.lbl_image_hint.setText(tr("region_hint"))
+        else:
+            self.btn_region.setChecked(False)
+
+    def _end_region_mode(self):
+        self.btn_region.setChecked(False)
+        self.lbl_image_hint.clear()
+
+    def _on_region_selected(self, rect):
+        self._end_region_mode()
+        self._read_into_current((rect.left(), rect.top(), rect.right(), rect.bottom()))
+
+    def reread_image(self):
+        self._read_into_current(None)
+
+    def _read_into_current(self, rect):
+        p = self.current
+        if p is None or p.image is None:
+            return
+        image = p.image
+        self._busy(tr("reading"), lambda: read_tables(image, rect, p.name, p.source, p.page),
+                   lambda tables: self._apply_tables(p, tables))
+
+    def _apply_tables(self, p, tables):
+        tables = [t for t in tables if t.points]
+        if not tables:
+            QMessageBox.information(self, tr("app_name"), tr("nothing_in_region"))
+            return
+        if p is not self.current:
+            return
+        self._push_undo()
+        first = tables[0]
+        p.points = first.points
+        if first.labels:
+            p.labels = first.labels
+        if first.stated_area and not p.stated_area:
+            p.stated_area = first.stated_area
+        p.method = "ocr"
+        for k, t in enumerate(tables[1:], 2):
+            t.name = f"{p.name}-{k}"
+            t.base_image, t.rotation = p.base_image, p.rotation
+            self.parcels.append(t)
+        self._refresh_list()
+        self._show_parcel(p)
+        self.lbl_image_hint.clear()
+        self.statusBar().showMessage(tr("region_read", n=len(first.points), t=len(tables)), 8000)
+
+    # ------------------------------------------------------- pdf, autocad
+    def _choose_parcels(self, title):
+        parcels = self._ready_parcels()
+        if len(parcels) <= 1:
+            return parcels
+        box = QMessageBox(QMessageBox.Question, title, tr("which_parcels"), parent=self)
+        b_cur = box.addButton(tr("dxf_current"), QMessageBox.AcceptRole)
+        b_all = box.addButton(tr("all_parcels"), QMessageBox.AcceptRole)
+        box.addButton(tr("cancel"), QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() == b_cur:
+            return [self.current] if self.current in parcels else parcels[:1]
+        if box.clickedButton() == b_all:
+            return parcels
+        return []
+
+    def export_pdf(self):
+        if not self._ready_parcels():
+            return QMessageBox.information(self, tr("app_name"), tr("no_parcels"))
+        chosen = self._choose_parcels(tr("export_pdf"))
+        if not chosen:
+            return
+        name = chosen[0].name if len(chosen) == 1 else "CoordX"
+        path = self._save_path(_safe_file(name), ".pdf", tr("export_pdf"))
+        if not path:
+            return
+        try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            write_report(chosen, path)
+        except Exception as e:
+            QMessageBox.critical(self, tr("app_name"), tr("save_error", e=e))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.statusBar().showMessage(tr("saved", f=path), 10000)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def open_in_autocad(self, path=None):
+        """Open `path`, or write the current parcel to a temporary DXF first and open that."""
+        if not path:
+            p = self.current
+            if p is None or not p.valid_points():
+                return QMessageBox.information(self, tr("app_name"), tr("no_parcels"))
+            folder = os.path.join(_temp_root(), "CoordX")
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, _safe_file(p.name) + ".dxf")
+            try:
+                export_dxf([p], path, self._view_options())
+            except Exception as e:
+                return QMessageBox.critical(self, tr("app_name"), tr("save_error", e=e))
+        try:
+            how = open_in_autocad(path, self.settings.value("acad_exe", None))
+        except Exception as e:
+            return QMessageBox.warning(self, tr("app_name"), tr("acad_error", e=e))
+        self.statusBar().showMessage(tr("acad_" + how), 8000)
+
     # ---------------------------------------------------------------- misc
     def toggle_theme(self):
         theme.apply(QApplication.instance(), "light" if theme.name() == "dark" else "dark")
@@ -894,6 +1139,11 @@ class MainWindow(QMainWindow):
 
     def about(self):
         SplashDialog(self, about=True).exec()
+
+
+def _temp_root():
+    import tempfile
+    return tempfile.gettempdir()
 
 
 def _set_state(widget, state):

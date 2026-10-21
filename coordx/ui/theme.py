@@ -131,6 +131,7 @@ QToolButton:pressed {{ background: {r["border"]}; }}
 QToolButton:checked {{ background: {r["accent_soft"]}; color: {r["accent_soft_text"]}; }}
 QToolButton:disabled {{ color: {r["text3"]}; }}
 QToolButton:focus {{ border: 1px solid {r["accent"]}; }}
+QToolButton::menu-indicator {{ image: none; width: 0; }}
 QToolButton#primary {{ background: {r["accent"]}; color: {r["accent_text"]}; font-weight: 600;
                       padding: {S1 + 2}px {S4}px; }}
 QToolButton#primary:hover {{ background: {r["accent_hover"]}; }}

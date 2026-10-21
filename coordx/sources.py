@@ -12,7 +12,12 @@ from .textnorm import Token
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 PDF_EXT = {".pdf"}
 TABLE_EXT = {".xlsx", ".xlsm", ".csv", ".txt"}
-ALL_EXT = IMAGE_EXT | PDF_EXT | TABLE_EXT
+DXF_EXT = {".dxf"}
+ALL_EXT = IMAGE_EXT | PDF_EXT | TABLE_EXT | DXF_EXT | {".dwg"}
+
+
+class DwgError(ValueError):
+    """DWG is a closed format: the user has to save it as DXF first."""
 
 _ocr = None
 _tmpdir = None
@@ -124,4 +129,9 @@ def load_file(path: str, progress=None) -> list[Parcel]:
         return load_pdf(path, progress)
     if ext in TABLE_EXT:
         return read_table_file(path)
+    if ext in DXF_EXT:
+        from .dxf_import import read_dxf
+        return read_dxf(path)
+    if ext == ".dwg":
+        raise DwgError(path)
     raise ValueError(f"unsupported file type: {ext}")

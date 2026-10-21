@@ -32,7 +32,9 @@ class Parcel:
     # Numbers found elsewhere in the source (side lengths written on the plan)
     labels: list[float] = field(default_factory=list)
     stated_area: float | None = None
-    method: str = ""          # "ocr", "pdf-text", "excel", "manual"
+    method: str = ""          # "ocr", "pdf-text", "excel", "dxf", "manual"
+    base_image: str | None = None  # unrotated image; `image` is it turned by `rotation` degrees
+    rotation: float = 0.0
 
     def valid_points(self) -> list[Point]:
         return [p for p in self.points if p.valid]
