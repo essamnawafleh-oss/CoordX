@@ -1,28 +1,32 @@
+import copy
 import os
 import subprocess
 import sys
 
 from PySide6.QtCore import QSettings, Qt, QThread, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
                                QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
                                QMessageBox, QProgressDialog, QPushButton, QSizePolicy, QSplitter, QTableWidget,
-                               QTableWidgetItem, QToolBar, QVBoxLayout, QWidget)
+                               QTableWidgetItem, QTabWidget, QToolBar, QVBoxLayout, QWidget)
 
 from .. import __version__
 from ..checks import analyze
 from ..excel_io import write_csv, write_excel
-from ..export_dxf import export_dxf
+from ..export_dxf import DxfOptions, build_drawing, export_dxf
 from ..i18n import lang, set_lang, tr
 from ..model import Parcel, Point
 from ..sources import ALL_EXT, load_file
 from ..textnorm import parse_float
-from .dialogs import DxfDialog
+from .dialogs import DxfDialog, PointDialog
+from .drawing_view import DrawingView
 from .image_view import ImageView
 from .splash import SplashDialog
 from .style import ERROR_BG, OK_FG, WARN_BG, resource
 
 FIELDS = ("no", "x", "y", "z")
+LAYER_KEYS = ("points", "numbers", "boundary", "lengths", "table", "area")
+UNDO_LIMIT = 100
 
 
 class LoadWorker(QThread):
@@ -62,6 +66,7 @@ class MainWindow(QMainWindow):
         self.report = None
         self.worker = None
         self._loading = False
+        self._undo = {}  # id(parcel) -> list of point snapshots
 
         self.setWindowIcon(QIcon(resource("assets", "icon.ico")))
         self.resize(1400, 860)
@@ -85,6 +90,8 @@ class MainWindow(QMainWindow):
                                triggered=self.export_dxf)
         self.act_xlsx = QAction(st.standardIcon(sp.SP_FileDialogDetailedView), "", self, triggered=self.export_excel)
         self.act_csv = QAction(st.standardIcon(sp.SP_FileDialogListView), "", self, triggered=self.export_csv)
+        self.act_undo = QAction(st.standardIcon(sp.SP_ArrowBack), "", self, shortcut=QKeySequence.Undo,
+                                triggered=self.undo)
         self.act_lang = QAction(st.standardIcon(sp.SP_BrowserReload), "", self, triggered=self.toggle_language)
         self.act_about = QAction(st.standardIcon(sp.SP_MessageBoxInformation), "", self, triggered=self.about)
         for a in (self.act_open, self.act_new, self.act_remove):
@@ -92,6 +99,8 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         for a in (self.act_dxf, self.act_xlsx, self.act_csv):
             tb.addAction(a)
+        tb.addSeparator()
+        tb.addAction(self.act_undo)
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         tb.addWidget(spacer)
@@ -109,9 +118,9 @@ class MainWindow(QMainWindow):
         self.list.currentRowChanged.connect(self._on_parcel_selected)
         ll.addWidget(self.list)
 
-        # middle: image
-        mid = QWidget()
-        ml = QVBoxLayout(mid)
+        # middle: source image and drawing viewer, as tabs
+        img_tab = QWidget()
+        ml = QVBoxLayout(img_tab)
         ml.setContentsMargins(6, 6, 6, 6)
         top = QHBoxLayout()
         self.lbl_source = QLabel()
@@ -122,6 +131,47 @@ class MainWindow(QMainWindow):
         ml.addLayout(top)
         self.view = ImageView()
         ml.addWidget(self.view, 1)
+
+        draw_tab = QWidget()
+        dl = QVBoxLayout(draw_tab)
+        dl.setContentsMargins(6, 6, 6, 6)
+        bar = QHBoxLayout()
+        self.layer_checks = {}
+        for key in LAYER_KEYS:
+            cb = QCheckBox()
+            cb.setChecked(self.settings.value(f"dxf/{key}", True, type=bool))
+            cb.toggled.connect(lambda on, k=key: self._on_layer_toggled(k, on))
+            bar.addWidget(cb)
+            self.layer_checks[key] = cb
+        bar.addStretch()
+        self.chk_drag = QCheckBox()
+        self.chk_drag.toggled.connect(lambda on: setattr(self.draw, "drag_enabled", on))
+        bar.addWidget(self.chk_drag)
+        self.btn_fit_draw = QPushButton(clicked=lambda: self.draw.fit())
+        bar.addWidget(self.btn_fit_draw)
+        dl.addLayout(bar)
+        self.draw = DrawingView()
+        self.draw.point_clicked.connect(self._on_point_clicked)
+        self.draw.point_moved.connect(self._on_point_moved)
+        self.draw.edit_requested.connect(self.edit_point)
+        self.draw.delete_requested.connect(self._on_point_delete)
+        self.draw.insert_after_requested.connect(self._on_insert_after)
+        self.draw.mouse_moved.connect(
+            lambda x, y: self.lbl_coords.setText(f"\u2066X = {x:,.3f}    Y = {y:,.3f}\u2069"))
+        dl.addWidget(self.draw, 1)
+        foot = QHBoxLayout()
+        self.lbl_hint = QLabel()
+        self.lbl_hint.setStyleSheet("color:#5A6B7B;")
+        self.lbl_coords = QLabel()
+        self.lbl_coords.setStyleSheet("font-family:Consolas,monospace; color:#1F4E78;")
+        foot.addWidget(self.lbl_hint, 1)
+        foot.addWidget(self.lbl_coords)
+        dl.addLayout(foot)
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(img_tab, "")
+        self.tabs.addTab(draw_tab, "")
+        mid = self.tabs
 
         # right: editor
         right = QWidget()
@@ -144,7 +194,7 @@ class MainWindow(QMainWindow):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.itemChanged.connect(self._on_cell_changed)
-        self.table.currentCellChanged.connect(lambda r, *_: self.view.select_row(r))
+        self.table.currentCellChanged.connect(self._on_row_changed)
         rl.addWidget(self.table, 3)
 
         btns = QHBoxLayout()
@@ -207,6 +257,15 @@ class MainWindow(QMainWindow):
         self.grp_checks.setTitle(tr("checks"))
         self.sides.setHorizontalHeaderLabels([tr("side"), tr("length"), tr("on_plan"), tr("status")])
         self.view.set_message(tr("drop_hint"))
+        self.draw.set_message(tr("viewer_empty"))
+        self.act_undo.setText(tr("undo"))
+        self.tabs.setTabText(0, tr("tab_image"))
+        self.tabs.setTabText(1, tr("tab_drawing"))
+        for key, cb in self.layer_checks.items():
+            cb.setText(tr(f"lay_{key}"))
+        self.chk_drag.setText(tr("drag_mode"))
+        self.btn_fit_draw.setText(tr("fit"))
+        self.lbl_hint.setText(tr("viewer_hint"))
         self._refresh_list()
         if self.current:
             self._show_parcel(self.current)
@@ -333,8 +392,11 @@ class MainWindow(QMainWindow):
             for lbl in (self.lbl_summary, self.lbl_stats, self.lbl_msgs, self.lbl_source):
                 lbl.clear()
             self.view.show_image(None, [])
+            self.draw.set_drawing(None, [], {}, {})
             self._loading = False
             return
+        if p.image is None:
+            self.tabs.setCurrentIndex(1)
         self.ed_name.setText(p.name)
         self.ed_area.setText("" if p.stated_area is None else f"{p.stated_area:g}")
         # isolate the file name so "1.jpg" doesn't turn into "jpg.1" in right-to-left text
@@ -401,6 +463,105 @@ class MainWindow(QMainWindow):
         self.lbl_summary.setObjectName("summary_ok" if n == 0 else "summary_bad")
         self.lbl_summary.setStyleSheet(f"color:{OK_FG if n == 0 else '#B02A37'}; font-weight:bold;")
         self._update_list_item()
+        self._redraw()
+
+    # ------------------------------------------------------------- drawing
+    def _view_options(self) -> DxfOptions:
+        h = None if self.settings.value("dxf/auto_h", True, type=bool) else self.settings.value("dxf/height", 1.5,
+                                                                                                  type=float)
+        return DxfOptions(**{k: cb.isChecked() for k, cb in self.layer_checks.items()}, text_height=h)
+
+    def _redraw(self):
+        p = self.current
+        if p is None or self.report is None:
+            return
+        levels = {}
+        for (r, f), (level, _, _) in self.report.cell_flags.items():
+            if f in ("x", "y") and levels.get(r) != "error":
+                levels[r] = level
+        labels = {k: f"{tr('col_no')} {pt.no}" for k, pt in enumerate(p.points)}
+        self.draw.set_drawing(id(p), build_drawing(p, self._view_options(), self.report), levels, labels)
+        r = self.table.currentRow()
+        if r >= 0:
+            self.draw.select(r)
+
+    def _on_layer_toggled(self, key, on):
+        self.settings.setValue(f"dxf/{key}", on)  # the DXF export uses the same choices
+        self._redraw()
+
+    def _on_row_changed(self, row, *_):
+        self.view.select_row(row)
+        self.draw.select(row)
+
+    def _on_point_clicked(self, index):
+        if index != self.table.currentRow():
+            self.table.setCurrentCell(index, max(self.table.currentColumn(), 1))
+        self.draw.select(index)
+
+    def _apply_point(self, index, values: dict):
+        """Change one point from the viewer, keeping the table and checks in sync."""
+        p = self.current
+        if p is None or not (0 <= index < len(p.points)):
+            return
+        self._push_undo()
+        pt = p.points[index]
+        for f, v in values.items():
+            setattr(pt, f, v)
+            pt.conf.pop(f, None)
+        if "no" in values and "split" in pt.notes:
+            pt.notes.remove("split")
+        self._show_parcel(p)
+        self.table.setCurrentCell(index, 1)
+
+    def _on_point_moved(self, index, x, y):
+        self._apply_point(index, {"x": x, "y": y})
+
+    def edit_point(self, index):
+        p = self.current
+        if p is None or not (0 <= index < len(p.points)):
+            return
+        dlg = PointDialog(self, p.points[index])
+        if dlg.exec() == PointDialog.Accepted:
+            self._apply_point(index, dlg.values())
+
+    def _on_point_delete(self, index):
+        self.table.setCurrentCell(index, 1)
+        self.delete_row()
+
+    def _on_insert_after(self, index):
+        p = self.current
+        if p is None:
+            return
+        self._push_undo()
+        a = p.points[index]
+        b = next((q for q in p.points[index + 1:] + p.points[:index] if q.valid and q is not a), None)
+        new = Point(no=_next_no(p))
+        if a.valid and b is not None:  # start in the middle of the side, then let the user type the values
+            new.x, new.y = round((a.x + b.x) / 2, 3), round((a.y + b.y) / 2, 3)
+        p.points.insert(index + 1, new)
+        self._show_parcel(p)
+        self.table.setCurrentCell(index + 1, 1)
+        self.edit_point(index + 1)
+
+    # ---------------------------------------------------------------- undo
+    def _push_undo(self):
+        if self.current is None:
+            return
+        stack = self._undo.setdefault(id(self.current), [])
+        stack.append(copy.deepcopy(self.current.points))
+        del stack[:-UNDO_LIMIT]
+
+    def undo(self):
+        p = self.current
+        stack = self._undo.get(id(p)) if p else None
+        if not stack:
+            return
+        row = self.table.currentRow()
+        p.points = stack.pop()
+        self._show_parcel(p)
+        self._refresh_list()
+        if 0 <= row < len(p.points):
+            self.table.setCurrentCell(row, 1)
 
     def _update_list_item(self):
         row = self.list.currentRow()
@@ -419,6 +580,7 @@ class MainWindow(QMainWindow):
             return
         pt = self.current.points[r]
         f = FIELDS[c]
+        self._push_undo()
         if f == "no":
             pt.no = item.text().strip()
         else:
@@ -435,6 +597,7 @@ class MainWindow(QMainWindow):
     def add_row(self):
         if self.current is None:
             return
+        self._push_undo()
         self.current.points.append(Point(no=_next_no(self.current)))
         self._show_parcel(self.current)
         self.table.setCurrentCell(len(self.current.points) - 1, 1)
@@ -444,6 +607,7 @@ class MainWindow(QMainWindow):
         r = self._table_row()
         if self.current is None or r is None:
             return self.add_row()
+        self._push_undo()
         self.current.points.insert(r, Point())
         self._show_parcel(self.current)
         self.table.setCurrentCell(r, 1)
@@ -452,6 +616,7 @@ class MainWindow(QMainWindow):
         r = self._table_row()
         if self.current is None or r is None:
             return
+        self._push_undo()
         del self.current.points[r]
         self._show_parcel(self.current)
         self.table.setCurrentCell(min(r, len(self.current.points) - 1), 1)
@@ -462,6 +627,7 @@ class MainWindow(QMainWindow):
         pts = self.current.points if self.current else []
         if r is None or not (0 <= r + d < len(pts)):
             return
+        self._push_undo()
         pts[r], pts[r + d] = pts[r + d], pts[r]
         self._show_parcel(self.current)
         self.table.setCurrentCell(r + d, 1)
@@ -469,6 +635,7 @@ class MainWindow(QMainWindow):
     def swap_xy(self):
         if self.current is None:
             return
+        self._push_undo()
         for pt in self.current.points:
             pt.x, pt.y = pt.y, pt.x
             cx, cy = pt.conf.pop("x", None), pt.conf.pop("y", None)
@@ -481,6 +648,7 @@ class MainWindow(QMainWindow):
     def renumber(self):
         if self.current is None:
             return
+        self._push_undo()
         for i, pt in enumerate(self.current.points, 1):
             pt.no = str(i)
             pt.conf.pop("no", None)
@@ -527,6 +695,11 @@ class MainWindow(QMainWindow):
         if dlg.exec() != DxfDialog.Accepted:
             return
         opts, which = dlg.options(), dlg.which()
+        for key, cb in self.layer_checks.items():  # the dialog may have changed the shared layer choices
+            cb.blockSignals(True)
+            cb.setChecked(getattr(opts, key))
+            cb.blockSignals(False)
+        self._redraw()
         if which == DxfDialog.CURRENT or len(parcels) == 1:
             chosen = [self.current] if self.current in parcels else parcels[:1]
         else:

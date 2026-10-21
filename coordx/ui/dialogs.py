@@ -1,8 +1,10 @@
-from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QGroupBox,
-                               QHBoxLayout, QLabel, QRadioButton, QVBoxLayout)
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
+                               QGroupBox, QHBoxLayout, QLabel, QLineEdit, QRadioButton, QVBoxLayout)
 
 from ..export_dxf import DxfOptions
 from ..i18n import tr
+from ..textnorm import parse_float
 
 
 class DxfDialog(QDialog):
@@ -64,3 +66,33 @@ class DxfDialog(QDialog):
 
     def which(self) -> int:
         return self.group.checkedId()
+
+
+class PointDialog(QDialog):
+    """Edit one point's number and coordinates."""
+
+    def __init__(self, parent, point):
+        super().__init__(parent)
+        self.setWindowTitle(tr("edit_point"))
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+        self.fields = {}
+        for key, label in (("no", "col_no"), ("x", "col_x"), ("y", "col_y"), ("z", "col_z")):
+            v = getattr(point, key)
+            ed = QLineEdit("" if v is None else (v if key == "no" else f"{v:.3f}"))
+            ed.setLayoutDirection(Qt.LeftToRight)
+            ed.setMinimumWidth(180)
+            form.addRow(tr(label), ed)
+            self.fields[key] = ed
+        lay.addLayout(form)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText(tr("ok"))
+        bb.button(QDialogButtonBox.Cancel).setText(tr("cancel"))
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+        self.fields["x"].setFocus()
+        self.fields["x"].selectAll()
+
+    def values(self):
+        return {"no": self.fields["no"].text().strip(), **{k: parse_float(self.fields[k].text()) for k in "xyz"}}

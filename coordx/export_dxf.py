@@ -1,12 +1,13 @@
-"""Write parcels to an AutoCAD DXF drawing."""
+"""Build the drawing of a parcel and write it to an AutoCAD DXF file.
+
+build_drawing() produces plain entities that both the DXF writer and the
+on-screen viewer use, so what the viewer shows is what the DXF contains.
+"""
 from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
-
-import ezdxf
-from ezdxf.enums import TextEntityAlignment
+from dataclasses import dataclass, field
 
 from .checks import analyze, centroid
 from .model import Parcel
@@ -26,6 +27,15 @@ class DxfOptions:
 LAYERS = {  # name: ACI colour
     "POINTS": 1, "POINT_NO": 7, "BOUNDARY": 3, "LENGTHS": 4, "TABLE": 8, "AREA": 2,
 }
+
+
+@dataclass
+class Ent:
+    kind: str    # "point", "text", "poly", "line"
+    layer: str
+    # point: x, y, z, index | text: text, pos, height, rotation, align ("center"/"left")
+    # poly: pts, closed | line: a, b
+    data: dict = field(default_factory=dict)
 
 
 def _layer_prefix(name: str) -> str:
@@ -55,80 +65,62 @@ def _readable(angle: float) -> float:
     return a
 
 
-def export_dxf(parcels: list[Parcel], path: str, opts: DxfOptions):
-    doc = ezdxf.new("R2010", setup=True)
-    doc.units = ezdxf.units.M
-    if "COORDX" not in doc.styles:
-        doc.styles.new("COORDX", dxfattribs={"font": "arial.ttf"})
-    msp = doc.modelspace()
-    multi = len(parcels) > 1
-    max_h = 0
+def build_drawing(parcel: Parcel, opts: DxfOptions, rep=None) -> list[Ent]:
+    """Entities for one parcel. Point entities keep their row index in parcel.points."""
+    rows = [(k, p) for k, p in enumerate(parcel.points) if p.valid]
+    if not rows:
+        return []
+    pts = [p for _, p in rows]
+    rep = rep or analyze(parcel)
+    h = opts.text_height or auto_text_height(parcel)
+    out: list[Ent] = []
 
-    for parcel in parcels:
-        pts = parcel.valid_points()
-        if not pts:
-            continue
-        h = opts.text_height or auto_text_height(parcel)
-        max_h = max(max_h, h)
-        pre = _layer_prefix(parcel.name) if multi else ""
-        for lname, color in LAYERS.items():
-            if pre + lname not in doc.layers:
-                doc.layers.add(pre + lname, color=color)
-        L = lambda n: {"layer": pre + n}
-        txt = lambda n, extra=None: {"layer": pre + n, "style": "COORDX", **(extra or {})}
+    def text(layer, s, pos, height, rotation=0.0, align="center"):
+        out.append(Ent("text", layer, {"text": s, "pos": pos, "height": height, "rotation": rotation,
+                                       "align": align}))
 
-        xy = [(p.x, p.y) for p in pts]
-        cx, cy = centroid(xy) if len(xy) >= 3 else (sum(x for x, _ in xy) / len(xy), sum(y for _, y in xy) / len(xy))
+    xy = [(p.x, p.y) for p in pts]
+    closed = len(xy) >= 3
+    cx, cy = centroid(xy) if closed else (sum(x for x, _ in xy) / len(xy), sum(y for _, y in xy) / len(xy))
 
-        if opts.points:
-            for p in pts:
-                msp.add_point((p.x, p.y, p.z or 0.0), dxfattribs=L("POINTS"))
+    if opts.boundary and len(xy) >= 2:
+        out.append(Ent("poly", "BOUNDARY", {"pts": xy, "closed": closed}))
 
-        if opts.numbers:
-            for p in pts:
-                dx, dy = p.x - cx, p.y - cy
-                d = math.hypot(dx, dy) or 1
-                pos = (p.x + dx / d * h * 1.1, p.y + dy / d * h * 1.1)
-                msp.add_text(p.no, height=h, dxfattribs=txt("POINT_NO")).set_placement(
-                    pos, align=TextEntityAlignment.MIDDLE_CENTER)
+    if opts.lengths and len(xy) >= 2:
+        n = len(xy)
+        for a in range(n if closed else n - 1):
+            (x0, y0), (x1, y1) = xy[a], xy[(a + 1) % n]
+            length = math.hypot(x1 - x0, y1 - y0)
+            if length < 1e-6:
+                continue
+            mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+            nx, ny = -(y1 - y0) / length, (x1 - x0) / length
+            if (mx - cx) * nx + (my - cy) * ny < 0:  # put the label outside
+                nx, ny = -nx, -ny
+            text("LENGTHS", f"{length:.2f}", (mx + nx * h * 0.8, my + ny * h * 0.8), h * 0.8,
+                 _readable(math.atan2(y1 - y0, x1 - x0)))
 
-        closed = len(xy) >= 3
-        if opts.boundary and len(xy) >= 2:
-            msp.add_lwpolyline(xy, close=closed, dxfattribs=L("BOUNDARY"))
+    if opts.points:
+        for k, p in rows:
+            out.append(Ent("point", "POINTS", {"x": p.x, "y": p.y, "z": p.z or 0.0, "index": k}))
 
-        if opts.lengths and len(xy) >= 2:
-            n = len(xy)
-            for a in range(n if closed else n - 1):
-                (x0, y0), (x1, y1) = xy[a], xy[(a + 1) % n]
-                length = math.hypot(x1 - x0, y1 - y0)
-                if length < 1e-6:
-                    continue
-                mx, my = (x0 + x1) / 2, (y0 + y1) / 2
-                nx, ny = -(y1 - y0) / length, (x1 - x0) / length
-                if (mx - cx) * nx + (my - cy) * ny < 0:  # put the label outside
-                    nx, ny = -nx, -ny
-                pos = (mx + nx * h * 0.8, my + ny * h * 0.8)
-                msp.add_text(f"{length:.2f}", height=h * 0.8,
-                             dxfattribs=txt("LENGTHS", {"rotation": _readable(math.atan2(y1 - y0, x1 - x0))})
-                             ).set_placement(pos, align=TextEntityAlignment.MIDDLE_CENTER)
+    if opts.numbers:
+        for p in pts:
+            dx, dy = p.x - cx, p.y - cy
+            d = math.hypot(dx, dy) or 1
+            text("POINT_NO", p.no, (p.x + dx / d * h * 1.1, p.y + dy / d * h * 1.1), h)
 
-        rep = analyze(parcel)
-        if opts.area and closed:
-            msp.add_text(parcel.name, height=h * 1.3, dxfattribs=txt("AREA")).set_placement(
-                (cx, cy + h * 1.2), align=TextEntityAlignment.MIDDLE_CENTER)
-            msp.add_text(f"A = {rep.area:.2f} m2", height=h * 1.3, dxfattribs=txt("AREA")).set_placement(
-                (cx, cy - h * 1.2), align=TextEntityAlignment.MIDDLE_CENTER)
+    if opts.area and closed:
+        text("AREA", parcel.name, (cx, cy + h * 1.2), h * 1.3)
+        text("AREA", f"A = {rep.area:.2f} m2", (cx, cy - h * 1.2), h * 1.3)
 
-        if opts.table:
-            _coord_table(msp, parcel, pts, rep, h, txt, L)
-
-    doc.header["$PDMODE"] = 35
-    doc.header["$PDSIZE"] = (max_h or 1.0) * 0.6
-    doc.header["$TEXTSTYLE"] = "COORDX"
-    doc.saveas(path)
+    if opts.table:
+        out.extend(_coord_table(parcel, pts, rep, h))
+    return out
 
 
-def _coord_table(msp, parcel, pts, rep, h, txt, L):
+def _coord_table(parcel, pts, rep, h) -> list[Ent]:
+    out = []
     has_z = any(p.z is not None for p in pts)
     widths = [h * 4, h * 10, h * 10] + ([h * 7] if has_z else [])
     heads = ["No.", "X (E)", "Y (N)"] + (["Z"] if has_z else [])
@@ -139,25 +131,66 @@ def _coord_table(msp, parcel, pts, rep, h, txt, L):
     rows = [heads] + [[p.no, f"{p.x:.2f}", f"{p.y:.2f}"] + ([f"{p.z:.2f}" if p.z is not None else ""] if has_z else [])
                       for p in pts]
 
-    title_y = y0 + rh * 0.6
-    msp.add_text(parcel.name, height=h * 1.2, dxfattribs=txt("TABLE")).set_placement(
-        (x0 + total_w / 2, title_y), align=TextEntityAlignment.MIDDLE_CENTER)
+    def text(s, pos, height, align="center"):
+        out.append(Ent("text", "TABLE", {"text": s, "pos": pos, "height": height, "rotation": 0.0, "align": align}))
+
+    text(parcel.name, (x0 + total_w / 2, y0 + rh * 0.6), h * 1.2)
     n_rows = len(rows)
     for r in range(n_rows + 1):
         y = y0 - r * rh
-        msp.add_line((x0, y), (x0 + total_w, y), dxfattribs=L("TABLE"))
+        out.append(Ent("line", "TABLE", {"a": (x0, y), "b": (x0 + total_w, y)}))
     x = x0
     for w in [0] + widths:
         x += w
-        msp.add_line((x, y0), (x, y0 - n_rows * rh), dxfattribs=L("TABLE"))
+        out.append(Ent("line", "TABLE", {"a": (x, y0), "b": (x, y0 - n_rows * rh)}))
     for r, row in enumerate(rows):
         x = x0
         for w, val in zip(widths, row):
-            msp.add_text(val, height=h, dxfattribs=txt("TABLE")).set_placement(
-                (x + w / 2, y0 - r * rh - rh / 2), align=TextEntityAlignment.MIDDLE_CENTER)
+            text(val, (x + w / 2, y0 - r * rh - rh / 2), h)
             x += w
     y = y0 - n_rows * rh - rh * 0.8
-    msp.add_text(f"AREA = {rep.area:.2f} m2", height=h, dxfattribs=txt("TABLE")).set_placement(
-        (x0, y), align=TextEntityAlignment.MIDDLE_LEFT)
-    msp.add_text(f"PERIMETER = {rep.perimeter:.2f} m", height=h, dxfattribs=txt("TABLE")).set_placement(
-        (x0, y - rh), align=TextEntityAlignment.MIDDLE_LEFT)
+    text(f"AREA = {rep.area:.2f} m2", (x0, y), h, "left")
+    text(f"PERIMETER = {rep.perimeter:.2f} m", (x0, y - rh), h, "left")
+    return out
+
+
+def export_dxf(parcels: list[Parcel], path: str, opts: DxfOptions):
+    import ezdxf
+    from ezdxf.enums import TextEntityAlignment
+
+    align = {"center": TextEntityAlignment.MIDDLE_CENTER, "left": TextEntityAlignment.MIDDLE_LEFT}
+    doc = ezdxf.new("R2010", setup=True)
+    doc.units = ezdxf.units.M
+    if "COORDX" not in doc.styles:
+        doc.styles.new("COORDX", dxfattribs={"font": "arial.ttf"})
+    msp = doc.modelspace()
+    multi = len(parcels) > 1
+    max_h = 0
+
+    for parcel in parcels:
+        ents = build_drawing(parcel, opts)
+        if not ents:
+            continue
+        max_h = max(max_h, opts.text_height or auto_text_height(parcel))
+        pre = _layer_prefix(parcel.name) if multi else ""
+        for lname, color in LAYERS.items():
+            if pre + lname not in doc.layers:
+                doc.layers.add(pre + lname, color=color)
+        for e in ents:
+            attrs = {"layer": pre + e.layer}
+            d = e.data
+            if e.kind == "point":
+                msp.add_point((d["x"], d["y"], d["z"]), dxfattribs=attrs)
+            elif e.kind == "poly":
+                msp.add_lwpolyline(d["pts"], close=d["closed"], dxfattribs=attrs)
+            elif e.kind == "line":
+                msp.add_line(d["a"], d["b"], dxfattribs=attrs)
+            elif e.kind == "text":
+                attrs.update(style="COORDX", rotation=d["rotation"])
+                msp.add_text(d["text"], height=d["height"], dxfattribs=attrs).set_placement(
+                    d["pos"], align=align[d["align"]])
+
+    doc.header["$PDMODE"] = 35
+    doc.header["$PDSIZE"] = (max_h or 1.0) * 0.6
+    doc.header["$TEXTSTYLE"] = "COORDX"
+    doc.saveas(path)

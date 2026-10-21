@@ -111,3 +111,13 @@ def test_ocr_sample_image():
     from coordx.sources import load_file
     p = load_file(os.environ["COORDX_SAMPLE"])[0]
     assert [(q.x, q.y) for q in p.points] == PLAN
+
+
+def test_build_drawing_matches_options():
+    from coordx.export_dxf import build_drawing
+    p = Parcel("t", [Point(str(i), x, y) for i, (x, y) in enumerate(PLAN, 1)])
+    ents = build_drawing(p, DxfOptions())
+    assert sum(e.kind == "point" for e in ents) == 13
+    assert [e.data["index"] for e in ents if e.kind == "point"] == list(range(13))
+    only_pts = build_drawing(p, DxfOptions(numbers=False, boundary=False, lengths=False, table=False, area=False))
+    assert {e.kind for e in only_pts} == {"point"}
