@@ -6,3 +6,4 @@ Output/
 *.spec
 .venv*/
 .pytest_cache/
+junit.xml
