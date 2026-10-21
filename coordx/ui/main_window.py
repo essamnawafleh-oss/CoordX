@@ -3,12 +3,12 @@ import os
 import subprocess
 import sys
 
-from PySide6.QtCore import QSettings, Qt, QThread, Signal
-from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
-                               QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
-                               QMessageBox, QProgressDialog, QPushButton, QSizePolicy, QSplitter, QTableWidget,
-                               QTableWidgetItem, QTabWidget, QToolBar, QVBoxLayout, QWidget)
+from PySide6.QtCore import QSettings, QSize, Qt, QThread, Signal
+from PySide6.QtGui import QAction, QIcon, QKeySequence, QPixmap
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QFileDialog, QFrame, QGridLayout,
+                               QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+                               QMainWindow, QMessageBox, QProgressDialog, QPushButton, QSizePolicy, QSplitter,
+                               QTableWidget, QTableWidgetItem, QTabWidget, QToolBar, QVBoxLayout, QWidget)
 
 from .. import __version__
 from ..checks import analyze
@@ -22,7 +22,9 @@ from .dialogs import DxfDialog, PointDialog
 from .drawing_view import DrawingView
 from .image_view import ImageView
 from .splash import SplashDialog
-from .style import ERROR_BG, OK_FG, WARN_BG, resource
+from . import icons, theme
+from .style import resource
+from .theme import S1, S2, S3, S4, S6
 
 FIELDS = ("no", "x", "y", "z")
 LAYER_KEYS = ("points", "numbers", "boundary", "lengths", "table", "area")
@@ -76,57 +78,92 @@ class MainWindow(QMainWindow):
         self._show_parcel(None)
 
     # ------------------------------------------------------------------ UI
+    def _card(self, margins=S4):
+        card = QFrame(objectName="card")
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(margins, margins, margins, margins)
+        lay.setSpacing(S3)
+        return card, lay
+
+    def _action(self, icon_name, slot, shortcut=None):
+        a = QAction(self, triggered=slot)
+        if shortcut is not None:
+            a.setShortcut(shortcut)
+        self._icon_names[a] = icon_name
+        return a
+
     def _build(self):
+        self._icon_names = {}
         tb = QToolBar(movable=False)
+        tb.setIconSize(QSize(18, 18))
         tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.addToolBar(tb)
-        st = self.style()
-        sp = st.StandardPixmap
-        self.act_open = QAction(st.standardIcon(sp.SP_DialogOpenButton), "", self, shortcut=QKeySequence.Open,
-                                triggered=self.open_files)
-        self.act_new = QAction(st.standardIcon(sp.SP_FileIcon), "", self, triggered=self.new_parcel)
-        self.act_remove = QAction(st.standardIcon(sp.SP_TrashIcon), "", self, triggered=self.remove_parcel)
-        self.act_dxf = QAction(st.standardIcon(sp.SP_DialogSaveButton), "", self, shortcut=QKeySequence.Save,
-                               triggered=self.export_dxf)
-        self.act_xlsx = QAction(st.standardIcon(sp.SP_FileDialogDetailedView), "", self, triggered=self.export_excel)
-        self.act_csv = QAction(st.standardIcon(sp.SP_FileDialogListView), "", self, triggered=self.export_csv)
-        self.act_undo = QAction(st.standardIcon(sp.SP_ArrowBack), "", self, shortcut=QKeySequence.Undo,
-                                triggered=self.undo)
-        self.act_lang = QAction(st.standardIcon(sp.SP_BrowserReload), "", self, triggered=self.toggle_language)
-        self.act_about = QAction(st.standardIcon(sp.SP_MessageBoxInformation), "", self, triggered=self.about)
+
+        brand = QWidget()
+        bl = QHBoxLayout(brand)
+        bl.setContentsMargins(0, 0, S4, 0)
+        bl.setSpacing(S2)
+        logo = QLabel()
+        logo.setPixmap(QPixmap(resource("assets", "icon.png")).scaled(26, 26, Qt.KeepAspectRatio,
+                                                                       Qt.SmoothTransformation))
+        self.lbl_brand = QLabel(objectName="title")
+        bl.addWidget(logo)
+        bl.addWidget(self.lbl_brand)
+        tb.addWidget(brand)
+
+        self.act_open = self._action("open", self.open_files, QKeySequence.Open)
+        self.act_new = self._action("new", self.new_parcel)
+        self.act_remove = self._action("trash", self.remove_parcel)
+        self.act_undo = self._action("undo", self.undo, QKeySequence.Undo)
+        self.act_theme = self._action("moon", self.toggle_theme)
+        self.act_lang = self._action("lang", self.toggle_language)
+        self.act_about = self._action("info", self.about)
+        self.act_xlsx = self._action("excel", self.export_excel)
+        self.act_csv = self._action("csv", self.export_csv)
+        self.act_dxf = self._action("dxf", self.export_dxf, QKeySequence.Save)
         for a in (self.act_open, self.act_new, self.act_remove):
-            tb.addAction(a)
-        tb.addSeparator()
-        for a in (self.act_dxf, self.act_xlsx, self.act_csv):
             tb.addAction(a)
         tb.addSeparator()
         tb.addAction(self.act_undo)
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         tb.addWidget(spacer)
-        tb.addAction(self.act_lang)
-        tb.addAction(self.act_about)
+        for a in (self.act_theme, self.act_lang, self.act_about):
+            tb.addAction(a)
+        tb.addSeparator()
+        for a in (self.act_xlsx, self.act_csv, self.act_dxf):
+            tb.addAction(a)
+        tb.widgetForAction(self.act_dxf).setObjectName("primary")
+        for a in (self.act_theme, self.act_lang, self.act_about):
+            tb.widgetForAction(a).setToolButtonStyle(Qt.ToolButtonIconOnly)
 
         # left: parcels
-        left = QWidget()
-        ll = QVBoxLayout(left)
-        ll.setContentsMargins(6, 6, 6, 6)
-        self.lbl_parcels = QLabel()
-        self.lbl_parcels.setStyleSheet("font-weight:bold;")
-        ll.addWidget(self.lbl_parcels)
+        left, ll = self._card()
+        head = QHBoxLayout()
+        self.lbl_parcels = QLabel(objectName="heading")
+        self.lbl_count = QLabel(objectName="caption")
+        head.addWidget(self.lbl_parcels)
+        head.addStretch()
+        head.addWidget(self.lbl_count)
+        ll.addLayout(head)
         self.list = QListWidget()
+        self.list.setIconSize(QSize(10, 10))
         self.list.currentRowChanged.connect(self._on_parcel_selected)
-        ll.addWidget(self.list)
+        self.lbl_list_hint = QLabel(objectName="caption", wordWrap=True)
+        ll.addWidget(self.lbl_list_hint)
+        ll.addWidget(self.list, 1)
 
         # middle: source image and drawing viewer, as tabs
+        mid, midl = self._card(S2)
         img_tab = QWidget()
         ml = QVBoxLayout(img_tab)
-        ml.setContentsMargins(6, 6, 6, 6)
+        ml.setContentsMargins(S2, S3, S2, S2)
+        ml.setSpacing(S2)
         top = QHBoxLayout()
-        self.lbl_source = QLabel()
-        self.lbl_source.setStyleSheet("color:#5A6B7B;")
+        self.lbl_source = QLabel(objectName="caption")
         top.addWidget(self.lbl_source, 1)
-        self.btn_fit = QPushButton(clicked=lambda: self.view.fit())
+        self.btn_fit = QPushButton(objectName="ghost", clicked=lambda: self.view.fit())
+        self._icon_names[self.btn_fit] = "fit"
         top.addWidget(self.btn_fit)
         ml.addLayout(top)
         self.view = ImageView()
@@ -134,11 +171,14 @@ class MainWindow(QMainWindow):
 
         draw_tab = QWidget()
         dl = QVBoxLayout(draw_tab)
-        dl.setContentsMargins(6, 6, 6, 6)
+        dl.setContentsMargins(S2, S3, S2, S2)
+        dl.setSpacing(S2)
         bar = QHBoxLayout()
+        bar.setSpacing(S1 + 2)
         self.layer_checks = {}
         for key in LAYER_KEYS:
-            cb = QCheckBox()
+            cb = QCheckBox(objectName="chip")
+            cb.setCursor(Qt.PointingHandCursor)
             cb.setChecked(self.settings.value(f"dxf/{key}", True, type=bool))
             cb.toggled.connect(lambda on, k=key: self._on_layer_toggled(k, on))
             bar.addWidget(cb)
@@ -147,7 +187,8 @@ class MainWindow(QMainWindow):
         self.chk_drag = QCheckBox()
         self.chk_drag.toggled.connect(lambda on: setattr(self.draw, "drag_enabled", on))
         bar.addWidget(self.chk_drag)
-        self.btn_fit_draw = QPushButton(clicked=lambda: self.draw.fit())
+        self.btn_fit_draw = QPushButton(objectName="ghost", clicked=lambda: self.draw.fit())
+        self._icon_names[self.btn_fit_draw] = "fit"
         bar.addWidget(self.btn_fit_draw)
         dl.addLayout(bar)
         self.draw = DrawingView()
@@ -157,108 +198,179 @@ class MainWindow(QMainWindow):
         self.draw.delete_requested.connect(self._on_point_delete)
         self.draw.insert_after_requested.connect(self._on_insert_after)
         self.draw.mouse_moved.connect(
-            lambda x, y: self.lbl_coords.setText(f"\u2066X = {x:,.3f}    Y = {y:,.3f}\u2069"))
+            lambda x, y: self.lbl_coords.setText(f"⁦X  {x:,.3f}     Y  {y:,.3f}⁩"))
         dl.addWidget(self.draw, 1)
         foot = QHBoxLayout()
-        self.lbl_hint = QLabel()
-        self.lbl_hint.setStyleSheet("color:#5A6B7B;")
-        self.lbl_coords = QLabel()
-        self.lbl_coords.setStyleSheet("font-family:Consolas,monospace; color:#1F4E78;")
+        self.lbl_hint = QLabel(objectName="caption")
+        self.lbl_coords = QLabel(objectName="coords")
         foot.addWidget(self.lbl_hint, 1)
         foot.addWidget(self.lbl_coords)
         dl.addLayout(foot)
 
-        self.tabs = QTabWidget()
+        self.tabs = QTabWidget(documentMode=True)
+        self.tabs.tabBar().setDrawBase(False)
         self.tabs.addTab(img_tab, "")
         self.tabs.addTab(draw_tab, "")
-        mid = self.tabs
+        midl.addWidget(self.tabs)
 
-        # right: editor
-        right = QWidget()
-        rl = QVBoxLayout(right)
-        rl.setContentsMargins(6, 6, 6, 6)
-        form = QFormLayout()
+        # right: editor card and checks card
+        right = QSplitter(Qt.Vertical)
+        right.setHandleWidth(S4)
+        right.setChildrenCollapsible(False)
+
+        edit_card, el = self._card()
+        form = QGridLayout()
+        form.setHorizontalSpacing(S3)
+        form.setVerticalSpacing(S1)
+        self.lbl_name, self.lbl_area = QLabel(objectName="caption"), QLabel(objectName="caption")
         self.ed_name = QLineEdit()
         self.ed_name.editingFinished.connect(self._on_name_changed)
         self.ed_area = QLineEdit()
         self.ed_area.editingFinished.connect(self._on_area_changed)
-        self.lbl_name, self.lbl_area = QLabel(), QLabel()
-        form.addRow(self.lbl_name, self.ed_name)
-        form.addRow(self.lbl_area, self.ed_area)
-        rl.addLayout(form)
+        form.addWidget(self.lbl_name, 0, 0)
+        form.addWidget(self.lbl_area, 0, 1)
+        form.addWidget(self.ed_name, 1, 0)
+        form.addWidget(self.ed_area, 1, 1)
+        form.setColumnStretch(0, 3)
+        form.setColumnStretch(1, 2)
+        el.addLayout(form)
 
         self.table = QTableWidget(0, 4)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setHighlightSections(False)
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(30)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.itemChanged.connect(self._on_cell_changed)
         self.table.currentCellChanged.connect(self._on_row_changed)
-        rl.addWidget(self.table, 3)
+        el.addWidget(self.table, 1)
 
         btns = QHBoxLayout()
+        btns.setSpacing(S1)
         self.btn_add = QPushButton(clicked=self.add_row)
-        self.btn_insert = QPushButton(clicked=self.insert_row)
-        self.btn_del = QPushButton(clicked=self.delete_row)
-        self.btn_up = QPushButton(clicked=lambda: self.move_row(-1))
-        self.btn_down = QPushButton(clicked=lambda: self.move_row(1))
-        self.btn_swap = QPushButton(clicked=self.swap_xy)
-        self.btn_renum = QPushButton(clicked=self.renumber)
-        for b in (self.btn_add, self.btn_insert, self.btn_del, self.btn_up, self.btn_down, self.btn_swap,
-                  self.btn_renum):
+        self.btn_insert = QPushButton(objectName="ghost", clicked=self.insert_row)
+        self.btn_del = QPushButton(objectName="ghost", clicked=self.delete_row)
+        self.btn_up = QPushButton(objectName="ghost", clicked=lambda: self.move_row(-1))
+        self.btn_down = QPushButton(objectName="ghost", clicked=lambda: self.move_row(1))
+        self.btn_swap = QPushButton(objectName="ghost", clicked=self.swap_xy)
+        self.btn_renum = QPushButton(objectName="ghost", clicked=self.renumber)
+        for b, ic in ((self.btn_add, "add"), (self.btn_insert, "insert"), (self.btn_del, "minus"),
+                      (self.btn_up, "up"), (self.btn_down, "down"), (self.btn_swap, "swap"),
+                      (self.btn_renum, "renumber")):
+            self._icon_names[b] = ic
+        btns.addWidget(self.btn_add)
+        btns.addStretch()
+        for b in (self.btn_insert, self.btn_del, self.btn_up, self.btn_down, self.btn_swap, self.btn_renum):
             btns.addWidget(b)
-        rl.addLayout(btns)
+        el.addLayout(btns)
+        right.addWidget(edit_card)
 
-        self.grp_checks = QGroupBox()
-        gl = QVBoxLayout(self.grp_checks)
-        self.lbl_summary = QLabel(wordWrap=True)
-        self.lbl_stats = QLabel(wordWrap=True)
-        self.lbl_msgs = QLabel(wordWrap=True)
-        self.lbl_msgs.setStyleSheet("color:#B02A37;")
-        gl.addWidget(self.lbl_summary)
-        gl.addWidget(self.lbl_stats)
-        gl.addWidget(self.lbl_msgs)
+        checks_card, cl = self._card()
+        head = QHBoxLayout()
+        self.lbl_checks = QLabel(objectName="heading")
+        head.addWidget(self.lbl_checks)
+        head.addStretch()
+        self.lbl_summary = QLabel(objectName="banner")
+        head.addWidget(self.lbl_summary)
+        cl.addLayout(head)
+        self.metrics_box = QWidget()
+        metrics = QHBoxLayout(self.metrics_box)
+        metrics.setContentsMargins(0, 0, 0, 0)
+        metrics.setSpacing(S6)
+        self.metric_vals, self.metric_caps = [], []
+        for _ in range(3):
+            box = QVBoxLayout()
+            box.setSpacing(0)
+            v, cap = QLabel(objectName="metric"), QLabel(objectName="metricCaption")
+            box.addWidget(v)
+            box.addWidget(cap)
+            metrics.addLayout(box)
+            self.metric_vals.append(v)
+            self.metric_caps.append(cap)
+        metrics.addStretch()
+        cl.addWidget(self.metrics_box)
+        self.lbl_stats = QLabel(objectName="note", wordWrap=True)
+        self.lbl_msgs = QLabel(objectName="danger", wordWrap=True)
+        cl.addWidget(self.lbl_stats)
+        cl.addWidget(self.lbl_msgs)
         self.sides = QTableWidget(0, 4)
+        self.sides.setAlternatingRowColors(True)
+        self.sides.setShowGrid(False)
         self.sides.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.sides.setSelectionMode(QAbstractItemView.NoSelection)
+        self.sides.setFocusPolicy(Qt.NoFocus)
         self.sides.verticalHeader().setVisible(False)
+        self.sides.verticalHeader().setDefaultSectionSize(28)
         self.sides.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        gl.addWidget(self.sides)
-        rl.addWidget(self.grp_checks, 2)
+        self.sides.horizontalHeader().setHighlightSections(False)
+        cl.addWidget(self.sides, 1)
+        right.addWidget(checks_card)
+        right.setSizes([470, 380])
+        right.setStretchFactor(0, 3)
+        right.setStretchFactor(1, 2)
+        self.table.setMinimumHeight(220)
 
         split = QSplitter(Qt.Horizontal)
+        split.setHandleWidth(S4)
         split.addWidget(left)
         split.addWidget(mid)
         split.addWidget(right)
-        split.setSizes([210, 640, 550])
+        split.setSizes([220, 640, 560])
         split.setStretchFactor(1, 1)
-        self.setCentralWidget(split)
+        central = QWidget(objectName="central")
+        cl2 = QVBoxLayout(central)
+        cl2.setContentsMargins(S4, S4, S4, S4)
+        cl2.addWidget(split)
+        self.setCentralWidget(central)
         self.editor = right
+        self._apply_theme_bits()
+
+    def _apply_theme_bits(self):
+        """Things the stylesheet can't reach: icons and the two canvases."""
+        for obj, name in self._icon_names.items():
+            role = "accent_text" if obj is self.act_dxf else "text"
+            if obj is self.act_theme:
+                name = "sun" if theme.name() == "dark" else "moon"
+            obj.setIcon(icons.icon(name, role))
+        self.tabs.setTabIcon(0, icons.icon("image", "text2"))
+        self.tabs.setTabIcon(1, icons.icon("drawing", "text2"))
+        self.view.setBackgroundBrush(theme.qc("image_bg"))
+        self.draw.setBackgroundBrush(theme.qc("canvas"))
 
     def retranslate(self):
         rtl = lang() == "ar"
         QApplication.instance().setLayoutDirection(Qt.RightToLeft if rtl else Qt.LeftToRight)
         self.setWindowTitle(f"{tr('app_title')}  —  {tr('version')} {__version__}")
+        self.lbl_brand.setText(tr("app_name"))
         for a, k in ((self.act_open, "open"), (self.act_new, "new_parcel"), (self.act_remove, "remove_parcel"),
                      (self.act_dxf, "export_dxf"), (self.act_xlsx, "export_excel"), (self.act_csv, "export_csv"),
-                     (self.act_lang, "language"), (self.act_about, "about")):
+                     (self.act_lang, "language"), (self.act_about, "about"), (self.act_undo, "undo"),
+                     (self.act_theme, "theme")):
             a.setText(tr(k))
+            a.setToolTip(tr(k))
         self.act_open.setToolTip(tr("open_tip"))
         self.lbl_parcels.setText(tr("parcels"))
+        self.lbl_list_hint.setText(tr("list_hint"))
         self.btn_fit.setText(tr("fit"))
         self.lbl_name.setText(tr("name"))
         self.lbl_area.setText(tr("stated_area"))
         self.ed_area.setPlaceholderText(tr("stated_area_ph"))
         self.table.setHorizontalHeaderLabels([tr("col_no"), tr("col_x"), tr("col_y"), tr("col_z")])
-        for b, k in ((self.btn_add, "add_row"), (self.btn_insert, "insert_row"), (self.btn_del, "del_row"),
-                     (self.btn_up, "up"), (self.btn_down, "down"), (self.btn_swap, "swap_xy"),
-                     (self.btn_renum, "renumber")):
+        for b, k in ((self.btn_add, "add_row"), (self.btn_swap, "swap_xy")):
             b.setText(tr(k))
-        self.grp_checks.setTitle(tr("checks"))
+        for b, k in ((self.btn_insert, "insert_row"), (self.btn_del, "del_row"), (self.btn_up, "move_up"),
+                     (self.btn_down, "move_down"), (self.btn_renum, "renumber"), (self.btn_swap, "swap_xy")):
+            b.setToolTip(tr(k))
+        self.lbl_checks.setText(tr("checks"))
+        for cap, k in zip(self.metric_caps, ("points_n", "area_m2", "perimeter_m")):
+            cap.setText(tr(k))
         self.sides.setHorizontalHeaderLabels([tr("side"), tr("length"), tr("on_plan"), tr("status")])
         self.view.set_message(tr("drop_hint"))
         self.draw.set_message(tr("viewer_empty"))
-        self.act_undo.setText(tr("undo"))
         self.tabs.setTabText(0, tr("tab_image"))
         self.tabs.setTabText(1, tr("tab_drawing"))
         for key, cb in self.layer_checks.items():
@@ -338,12 +450,12 @@ class MainWindow(QMainWindow):
         self.list.blockSignals(True)
         self.list.clear()
         for p in self.parcels:
-            issues = analyze(p).issue_count
-            mark = "✓" if issues == 0 and p.points else "⚠"
-            item = QListWidgetItem(f"{mark}  {p.name}   ({len(p.points)})")
-            item.setForeground(QColor(OK_FG) if mark == "✓" else QColor("#B26A00"))
+            item = QListWidgetItem()
+            self._style_list_item(item, p, analyze(p).issue_count == 0 and bool(p.points))
             self.list.addItem(item)
         self.list.blockSignals(False)
+        self.lbl_count.setText(str(len(self.parcels)) if self.parcels else "")
+        self.lbl_list_hint.setVisible(not self.parcels)
         if 0 <= row < len(self.parcels):
             self.list.setCurrentRow(row)
 
@@ -389,8 +501,11 @@ class MainWindow(QMainWindow):
             self.ed_area.clear()
             self.table.setRowCount(0)
             self.sides.setRowCount(0)
-            for lbl in (self.lbl_summary, self.lbl_stats, self.lbl_msgs, self.lbl_source):
+            for lbl in (self.lbl_stats, self.lbl_msgs, self.lbl_source, *self.metric_vals):
                 lbl.clear()
+            self.lbl_summary.setText(tr("no_parcel"))
+            _set_state(self.lbl_summary, "none")
+            self.metrics_box.setVisible(False)
             self.view.show_image(None, [])
             self.draw.set_drawing(None, [], {}, {})
             self._loading = False
@@ -429,10 +544,12 @@ class MainWindow(QMainWindow):
                 flag = rep.cell_flags.get((r, f))
                 if flag:
                     level, key, kw = flag
-                    item.setBackground(QColor(ERROR_BG if level == "error" else WARN_BG))
+                    item.setBackground(theme.qc("danger_bg" if level == "error" else "warn_bg"))
+                    item.setForeground(theme.qc("danger" if level == "error" else "warn"))
                     item.setToolTip(tr(key, **kw))
                 else:
-                    item.setBackground(QColor("white"))
+                    item.setData(Qt.BackgroundRole, None)  # let alternating rows show
+                    item.setData(Qt.ForegroundRole, None)
                     item.setToolTip("")
         self._loading = False
 
@@ -442,13 +559,17 @@ class MainWindow(QMainWindow):
             for c, v in enumerate(vals):
                 it = QTableWidgetItem(v)
                 if s.status == "ok":
-                    it.setForeground(QColor(OK_FG))
+                    it.setForeground(theme.qc("ok"))
                 elif s.status == "warn":
-                    it.setBackground(QColor(ERROR_BG))
+                    it.setBackground(theme.qc("danger_bg"))
+                    it.setForeground(theme.qc("danger"))
                 self.sides.setItem(r, c, it)
 
-        stats = [f"{tr('points_n')}: {len(p.valid_points())}", f"{tr('area')}: {rep.area:,.2f} m²",
-                 f"{tr('perimeter')}: {rep.perimeter:,.2f} m"]
+        self.metrics_box.setVisible(True)
+        for lbl, v in zip(self.metric_vals, (f"{len(p.valid_points())}", f"\u2066{rep.area:,.2f}\u2069",
+                                             f"\u2066{rep.perimeter:,.2f}\u2069")):
+            lbl.setText(v)
+        stats = []
         matched = sum(1 for s in rep.sides if s.status == "ok")
         if p.labels and rep.sides:
             stats.append(tr("sides_matched", m=matched, n=len(rep.sides)))
@@ -457,11 +578,12 @@ class MainWindow(QMainWindow):
         elif rep.area_status == "warn" and p.stated_area:
             stats.append(tr("area_warn", d=rep.area_diff, p=rep.area_diff / p.stated_area * 100))
         self.lbl_stats.setText("<br>".join(stats))
+        self.lbl_stats.setVisible(bool(stats))
         self.lbl_msgs.setText("<br>".join(tr(k, **kw) for _, k, kw in rep.messages))
+        self.lbl_msgs.setVisible(bool(rep.messages))
         n = rep.issue_count
         self.lbl_summary.setText(tr("summary_ok") if n == 0 else tr("summary_issues", n=n))
-        self.lbl_summary.setObjectName("summary_ok" if n == 0 else "summary_bad")
-        self.lbl_summary.setStyleSheet(f"color:{OK_FG if n == 0 else '#B02A37'}; font-weight:bold;")
+        _set_state(self.lbl_summary, "ok" if n == 0 else "bad")
         self._update_list_item()
         self._redraw()
 
@@ -568,9 +690,12 @@ class MainWindow(QMainWindow):
         if 0 <= row < len(self.parcels) and self.report is not None:
             p = self.parcels[row]
             ok = self.report.issue_count == 0 and p.points
-            item = self.list.item(row)
-            item.setText(f"{'✓' if ok else '⚠'}  {p.name}   ({len(p.points)})")
-            item.setForeground(QColor(OK_FG) if ok else QColor("#B26A00"))
+            self._style_list_item(self.list.item(row), p, bool(ok))
+
+    def _style_list_item(self, item, p, ok):
+        item.setText(f"{p.name}\n{tr('n_points', n=len(p.points))}")
+        item.setIcon(icons.dot("ok" if ok else "warn"))
+        item.setToolTip(tr("summary_ok") if ok else tr("needs_review"))
 
     def _on_cell_changed(self, item):
         if self._loading or self.current is None:
@@ -754,6 +879,14 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, tr("app_name"), tr("save_error", e=e))
 
     # ---------------------------------------------------------------- misc
+    def toggle_theme(self):
+        theme.apply(QApplication.instance(), "light" if theme.name() == "dark" else "dark")
+        self.settings.setValue("theme", theme.name())
+        self._apply_theme_bits()
+        self._refresh_list()
+        if self.current:
+            self._recheck()
+
     def toggle_language(self):
         set_lang("en" if lang() == "ar" else "ar")
         self.settings.setValue("lang", lang())
@@ -761,6 +894,13 @@ class MainWindow(QMainWindow):
 
     def about(self):
         SplashDialog(self, about=True).exec()
+
+
+def _set_state(widget, state):
+    """Switch a dynamic-property QSS state and re-polish so the style updates."""
+    widget.setProperty("state", state)
+    widget.style().unpolish(widget)
+    widget.style().polish(widget)
 
 
 def _fmt(v):

@@ -2,13 +2,14 @@
 import sys
 
 from PySide6.QtCore import QSettings
-from PySide6.QtGui import QFont, QIcon
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 from coordx.i18n import set_lang
 from coordx.ui.main_window import MainWindow
 from coordx.ui.splash import SplashDialog
-from coordx.ui.style import STYLESHEET, resource
+from coordx.ui import theme
+from coordx.ui.style import resource
 
 
 def selftest(src, out):
@@ -30,9 +31,9 @@ def main():
     app.setApplicationName("CoordX")
     app.setOrganizationName("CoordX")
     app.setWindowIcon(QIcon(resource("assets", "icon.ico")))
-    app.setFont(QFont("Segoe UI", 10))
-    app.setStyleSheet(STYLESHEET)
-    set_lang(QSettings("CoordX", "CoordX").value("lang", "ar"))
+    settings = QSettings("CoordX", "CoordX")
+    theme.apply(app, settings.value("theme", "light"))
+    set_lang(settings.value("lang", "ar"))
 
     win = MainWindow()
     SplashDialog().exec()
